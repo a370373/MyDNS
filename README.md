@@ -623,7 +623,7 @@ MyDNS 目前仍屬於持續開發中的 Recursive DNS Resolver。
 
 ## 📬 聯繫創作者
 
-- Instagram：[a370373/XRH](https://instagram.com/a370373)
+- Gmail: b0953166696@gmail.com
 - 本人17歲🤔 做的不好請見諒
 - 獨立開發 ＆ AI協作
 - 緩慢更新 ＆ 除錯
