@@ -83,13 +83,27 @@ async fn post_dns(
         );
     }
 
+    resolve_blocking(state.service, packet).await
+}
+
+
+/// Recursive resolution does blocking socket I/O; keep it off the
+/// async worker threads so a slow lookup cannot stall other requests.
+async fn resolve_blocking(
+    service: DnsService,
+    packet: Vec<u8>,
+) -> Result<Response, StatusCode> {
     let response =
-        state
-            .service
-            .handle_query(&packet)
-            .map_err(|_| {
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
+        tokio::task::spawn_blocking(move || {
+            service.handle_query(&packet)
+        })
+        .await
+        .map_err(|_| {
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .map_err(|_| {
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     Ok(dns_response(response))
 }
@@ -114,15 +128,7 @@ async fn get_dns(
         );
     }
 
-    let response =
-        state
-            .service
-            .handle_query(&packet)
-            .map_err(|_| {
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
-
-    Ok(dns_response(response))
+    resolve_blocking(state.service, packet).await
 }
 
 

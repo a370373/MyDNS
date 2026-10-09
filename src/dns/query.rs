@@ -1,4 +1,86 @@
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::collections::hash_map::RandomState;
+use std::hash::{BuildHasher, Hasher};
+use std::io;
+use std::net::{IpAddr, SocketAddr, UdpSocket};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+pub const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(3);
+
+fn random_id() -> u16 {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+
+    // RandomState is seeded from the OS, so the id is unpredictable.
+    let mut hasher = RandomState::new().build_hasher();
+    hasher.write_u128(nanos);
+    hasher.finish() as u16
+}
+
+/// Send `query` to `server:53` from a fresh socket and return the first
+/// reply that comes from that server, echoes `id` and has QR set.
+/// Late or spoofed datagrams are ignored until the timeout expires.
+pub fn exchange(
+    server: &str,
+    query: &[u8],
+    id: u16,
+    timeout: Duration,
+) -> io::Result<Vec<u8>> {
+    let ip: IpAddr = server.parse().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid upstream address",
+        )
+    })?;
+
+    exchange_with(SocketAddr::new(ip, 53), query, id, timeout)
+}
+
+pub fn exchange_with(
+    server: SocketAddr,
+    query: &[u8],
+    id: u16,
+    timeout: Duration,
+) -> io::Result<Vec<u8>> {
+    let bind = if server.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    };
+
+    let socket = UdpSocket::bind(bind)?;
+
+    // connect() makes the OS drop datagrams from any other source.
+    socket.connect(server)?;
+    socket.send(query)?;
+
+    let deadline = Instant::now() + timeout;
+    let mut buffer = [0u8; 4096];
+
+    loop {
+        let remaining =
+            deadline.saturating_duration_since(Instant::now());
+
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "upstream timed out",
+            ));
+        }
+
+        socket.set_read_timeout(Some(remaining))?;
+
+        let size = socket.recv(&mut buffer)?;
+
+        if size >= 12
+            && buffer[..2] == id.to_be_bytes()
+            && buffer[2] & 0x80 != 0
+        {
+            return Ok(buffer[..size].to_vec());
+        }
+    }
+}
 
 pub const TYPE_A: u16 = 1;
 pub const TYPE_NS: u16 = 2;
@@ -27,11 +109,7 @@ fn build_query_internal(
     record_type: u16,
     edns: bool,
 ) -> (u16, Vec<u8>) {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap();
-
-    let id = (now.subsec_nanos() & 0xffff) as u16;
+    let id = random_id();
 
     let mut packet = Vec::with_capacity(512);
 

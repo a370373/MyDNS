@@ -3,6 +3,8 @@ use std::time::{Duration, Instant};
 
 use crate::dns::record::DnsRecord;
 
+const MAX_ENTRIES: usize = 10_000;
+
 #[derive(Debug, Clone)]
 struct CacheEntry {
     records: Vec<DnsRecord>,
@@ -58,6 +60,17 @@ impl DnsCache {
             domain.to_ascii_lowercase(),
             record_type,
         );
+
+        if self.entries.len() >= MAX_ENTRIES {
+            let now = Instant::now();
+
+            self.entries
+                .retain(|_, entry| entry.expires_at > now);
+
+            if self.entries.len() >= MAX_ENTRIES {
+                self.entries.clear();
+            }
+        }
 
         self.entries.insert(
             key,

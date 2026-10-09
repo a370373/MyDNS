@@ -1,6 +1,5 @@
+use std::cell::Cell;
 use std::io;
-use std::net::UdpSocket;
-use std::time::Duration;
 
 use crate::dns::packet::{
     parse_authoritative,
@@ -16,11 +15,43 @@ use crate::dns::record::{
 };
 use crate::dns::query::{
     build_query,
+    exchange,
     TYPE_A,
     TYPE_AAAA,
     TYPE_HTTPS,
     TYPE_NS,
+    UPSTREAM_TIMEOUT,
 };
+
+const MAX_NS_LOOKUP_DEPTH: usize = 4;
+
+thread_local! {
+    static NS_LOOKUP_DEPTH: Cell<usize> = Cell::new(0);
+}
+
+/// Bounds the nested "resolve the nameserver's own address" lookups so
+/// glueless delegations that point at each other cannot recurse forever.
+struct NsLookupGuard;
+
+impl NsLookupGuard {
+    fn enter() -> Option<Self> {
+        NS_LOOKUP_DEPTH.with(|depth| {
+            if depth.get() >= MAX_NS_LOOKUP_DEPTH {
+                None
+            } else {
+                depth.set(depth.get() + 1);
+                Some(NsLookupGuard)
+            }
+        })
+    }
+}
+
+impl Drop for NsLookupGuard {
+    fn drop(&mut self) {
+        NS_LOOKUP_DEPTH
+            .with(|depth| depth.set(depth.get() - 1));
+    }
+}
 
 #[derive(Debug)]
 pub struct Resolution {
@@ -38,43 +69,28 @@ pub fn query_tld(
     tld_servers: &[IpRecord],
     domain: &str,
 ) -> io::Result<ReferralResponse> {
-    let (_, query) =
+    let (id, query) =
         build_query(domain, TYPE_NS);
-
-    let socket =
-        UdpSocket::bind("0.0.0.0:0")?;
-
-    socket.set_read_timeout(
-        Some(Duration::from_secs(3)),
-    )?;
 
     let mut last_error = None;
 
     for server in tld_servers {
-        let address =
-            format!("{}:53", server.address);
+        let response = match exchange(
+            &server.address,
+            &query,
+            id,
+            UPSTREAM_TIMEOUT,
+        ) {
+            Ok(response) => response,
 
-        if let Err(error) =
-            socket.send_to(&query, &address)
-        {
-            last_error = Some(error);
-            continue;
-        }
-
-        let mut response = [0u8; 4096];
-
-        let size =
-            match socket.recv_from(&mut response) {
-                Ok((size, _)) => size,
-
-                Err(error) => {
-                    last_error = Some(error);
-                    continue;
-                }
-            };
+            Err(error) => {
+                last_error = Some(error);
+                continue;
+            }
+        };
 
         let parsed =
-            match parse_referral(&response[..size]) {
+            match parse_referral(&response) {
                 Ok(parsed) => parsed,
 
                 Err(error) => {
@@ -100,7 +116,10 @@ pub fn query_tld(
          * Resolve the NS hostname itself to obtain
          * the authoritative server address.
          */
-        if parsed.ip_records.is_empty()
+        let ns_guard = NsLookupGuard::enter();
+
+        if ns_guard.is_some()
+            && parsed.ip_records.is_empty()
             && !parsed.ns_records.is_empty()
         {
             let mut resolved = parsed.clone();
@@ -207,50 +226,49 @@ pub fn query_tld(
     }))
 }
 
+const MAX_REFERRAL_HOPS: usize = 8;
+
 pub fn query_authoritative(
     authoritative_servers: &[IpRecord],
     domain: &str,
     record_type: u16,
 ) -> io::Result<Resolution> {
-    let (_, query) =
+    query_authoritative_hops(
+        authoritative_servers,
+        domain,
+        record_type,
+        0,
+    )
+}
+
+fn query_authoritative_hops(
+    authoritative_servers: &[IpRecord],
+    domain: &str,
+    record_type: u16,
+    hops: usize,
+) -> io::Result<Resolution> {
+    let (id, query) =
         build_query(domain, record_type);
-
-    let socket =
-        UdpSocket::bind("0.0.0.0:0")?;
-
-    socket.set_read_timeout(
-        Some(Duration::from_secs(3)),
-    )?;
 
     let mut last_error = None;
 
     for server in authoritative_servers {
-        let address =
-            format!("{}:53", server.address);
+        let response = match exchange(
+            &server.address,
+            &query,
+            id,
+            UPSTREAM_TIMEOUT,
+        ) {
+            Ok(response) => response,
 
-        if let Err(error) =
-            socket.send_to(&query, &address)
-        {
-            last_error = Some(error);
-            continue;
-        }
-
-        let mut response = [0u8; 4096];
-
-        let size =
-            match socket.recv_from(&mut response) {
-                Ok((size, _)) => size,
-
-                Err(error) => {
-                    last_error = Some(error);
-                    continue;
-                }
-            };
+            Err(error) => {
+                last_error = Some(error);
+                continue;
+            }
+        };
 
         let parsed =
-            match parse_authoritative(
-                &response[..size],
-            ) {
+            match parse_authoritative(&response) {
                 Ok(parsed) => parsed,
 
                 Err(error) => {
@@ -258,6 +276,38 @@ pub fn query_authoritative(
                     continue;
                 }
             };
+
+        // SERVFAIL / REFUSED: another nameserver may still answer.
+        if parsed.rcode == 2 || parsed.rcode == 5 {
+            last_error = Some(io::Error::new(
+                io::ErrorKind::Other,
+                format!(
+                    "{} answered rcode {}",
+                    server.address, parsed.rcode
+                ),
+            ));
+            continue;
+        }
+
+        // No answer but a delegation with glue: the zone is cut
+        // deeper than root/TLD/authoritative, follow it.
+        if parsed.records.is_empty()
+            && parsed.rcode == 0
+            && hops < MAX_REFERRAL_HOPS
+        {
+            if let Ok(referral) = parse_referral(&response) {
+                if !referral.ns_records.is_empty()
+                    && !referral.ip_records.is_empty()
+                {
+                    return query_authoritative_hops(
+                        &referral.ip_records,
+                        domain,
+                        record_type,
+                        hops + 1,
+                    );
+                }
+            }
+        }
 
         return Ok(Resolution {
             records: parsed.records,

@@ -1,6 +1,4 @@
 use std::io;
-use std::net::UdpSocket;
-use std::time::Duration;
 
 use crate::dns::packet::{
     parse_referral,
@@ -10,7 +8,9 @@ use crate::dns::packet::{
 };
 use crate::dns::query::{
     build_query,
+    exchange,
     TYPE_NS,
+    UPSTREAM_TIMEOUT,
 };
 
 pub const ROOT_SERVERS: &[&str] = &[
@@ -33,33 +33,17 @@ pub fn root_servers() -> &'static [&'static str] {
 }
 
 pub fn query_root(name: &str) -> io::Result<Vec<u8>> {
-    let (_, query) = build_query(name, TYPE_NS);
-
-    let socket =
-        UdpSocket::bind("0.0.0.0:0")?;
-
-    socket.set_read_timeout(
-        Some(Duration::from_secs(3)),
-    )?;
+    let (id, query) = build_query(name, TYPE_NS);
 
     for server in ROOT_SERVERS {
-        if socket
-            .send_to(&query, server)
-            .is_err()
+        let address = server.trim_end_matches(":53");
+
+        if let Ok(response) =
+            exchange(address, &query, id, UPSTREAM_TIMEOUT)
         {
-            continue;
-        }
-
-        let mut response = [0u8; 4096];
-
-        match socket.recv_from(&mut response) {
-            Ok((size, _)) => {
-                return Ok(
-                    response[..size].to_vec()
-                );
+            if parse_referral(&response).is_ok() {
+                return Ok(response);
             }
-
-            Err(_) => continue,
         }
     }
 
