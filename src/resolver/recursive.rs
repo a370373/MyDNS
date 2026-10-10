@@ -5,6 +5,7 @@ use crate::dns::packet::{
     parse_authoritative,
     parse_referral,
     IpRecord,
+    NsRecord,
     ReferralResponse,
 };
 
@@ -65,6 +66,77 @@ pub fn find_tld_servers(
     crate::resolver::root::resolve_tld(domain)
 }
 
+/// Resolve the address of the first nameserver (from a referral that
+/// carried no glue) whose name can be looked up. Empty if none can.
+fn resolve_glueless_ns(
+    domain: &str,
+    ns_records: &[NsRecord],
+) -> Vec<IpRecord> {
+    let Some(_guard) = NsLookupGuard::enter() else {
+        return Vec::new();
+    };
+
+    for ns in ns_records {
+        let ns_name = ns.target.trim_end_matches('.');
+
+        println!(
+            "No glue for {}. Resolving NS {}",
+            domain,
+            ns_name
+        );
+
+        let Ok(ns_root) = find_tld_servers(ns_name) else {
+            continue;
+        };
+
+        if ns_root.rcode != 0 || ns_root.ip_records.is_empty() {
+            continue;
+        }
+
+        let Ok(ns_tld) =
+            query_tld(&ns_root.ip_records, ns_name)
+        else {
+            continue;
+        };
+
+        if ns_tld.rcode != 0 || ns_tld.ip_records.is_empty() {
+            continue;
+        }
+
+        let mut addresses = Vec::new();
+
+        for record_type in [TYPE_A, TYPE_AAAA] {
+            let Ok(found) = resolve_authoritative(
+                &ns_tld.ip_records,
+                ns_name,
+                record_type,
+            ) else {
+                continue;
+            };
+
+            for record in found.records {
+                match record {
+                    DnsRecord::A(record)
+                    | DnsRecord::AAAA(record) => {
+                        addresses.push(IpRecord {
+                            name: record.name,
+                            address: record.address,
+                        });
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        if !addresses.is_empty() {
+            println!("Resolved authoritative NS {}", ns_name);
+            return addresses;
+        }
+    }
+
+    Vec::new()
+}
+
 pub fn query_tld(
     tld_servers: &[IpRecord],
     domain: &str,
@@ -116,102 +188,17 @@ pub fn query_tld(
          * Resolve the NS hostname itself to obtain
          * the authoritative server address.
          */
-        let ns_guard = NsLookupGuard::enter();
-
-        if ns_guard.is_some()
-            && parsed.ip_records.is_empty()
+        if parsed.ip_records.is_empty()
             && !parsed.ns_records.is_empty()
         {
-            let mut resolved = parsed.clone();
+            let addresses =
+                resolve_glueless_ns(domain, &parsed.ns_records);
 
-            for ns in &parsed.ns_records {
-                let ns_name = ns.target.trim_end_matches('.');
+            if !addresses.is_empty() {
+                let mut resolved = parsed.clone();
+                resolved.ip_records = addresses;
 
-                println!(
-                    "No TLD glue for {}. Resolving NS {}",
-                    domain,
-                    ns_name
-                );
-
-                let ns_root =
-                    match find_tld_servers(ns_name) {
-                        Ok(result) => result,
-
-                        Err(_) => continue,
-                    };
-
-                if ns_root.rcode != 0 {
-                    continue;
-                }
-
-                if ns_root.ip_records.is_empty() {
-                    continue;
-                }
-
-                let ns_tld =
-                    match query_tld(
-                        &ns_root.ip_records,
-                        ns_name,
-                    ) {
-                        Ok(result) => result,
-
-                        Err(_) => continue,
-                    };
-
-                if ns_tld.rcode != 0 {
-                    continue;
-                }
-
-                if ns_tld.ip_records.is_empty() {
-                    continue;
-                }
-
-                if let Ok(ns_a) =
-                    resolve_authoritative(
-                        &ns_tld.ip_records,
-                        ns_name,
-                        TYPE_A,
-                    )
-                {
-                    for record in ns_a.records {
-                        if let DnsRecord::A(record) = record {
-                            resolved.ip_records.push(
-                                IpRecord {
-                                    name: record.name,
-                                    address: record.address,
-                                },
-                            );
-                        }
-                    }
-                }
-
-                if let Ok(ns_aaaa) =
-                    resolve_authoritative(
-                        &ns_tld.ip_records,
-                        ns_name,
-                        TYPE_AAAA,
-                    )
-                {
-                    for record in ns_aaaa.records {
-                        if let DnsRecord::AAAA(record) = record {
-                            resolved.ip_records.push(
-                                IpRecord {
-                                    name: record.name,
-                                    address: record.address,
-                                },
-                            );
-                        }
-                    }
-                }
-
-                if !resolved.ip_records.is_empty() {
-                    println!(
-                        "Resolved authoritative NS {}",
-                        ns_name
-                    );
-
-                    return Ok(resolved);
-                }
+                return Ok(resolved);
             }
         }
 
@@ -296,11 +283,17 @@ fn query_authoritative_hops(
             && hops < MAX_REFERRAL_HOPS
         {
             if let Ok(referral) = parse_referral(&response) {
+                let next_servers = if referral.ip_records.is_empty() {
+                    resolve_glueless_ns(domain, &referral.ns_records)
+                } else {
+                    referral.ip_records.clone()
+                };
+
                 if !referral.ns_records.is_empty()
-                    && !referral.ip_records.is_empty()
+                    && !next_servers.is_empty()
                 {
                     return query_authoritative_hops(
-                        &referral.ip_records,
+                        &next_servers,
                         domain,
                         record_type,
                         hops + 1,

@@ -360,6 +360,27 @@ fn network_deeply_delegated_zone_is_resolved() {
 
 #[test]
 #[ignore]
+fn network_cname_into_glueless_delegation_is_resolved() {
+    // itunes.apple.com -> ...v.aaplimg.com, whose delegation carries NS names without glue.
+    let _server = Server::start();
+
+    for (id, name) in [
+        (0x2301, "itunes.apple.com"),
+        (0x2302, "updates.cdn-apple.com"),
+        (0x2303, "gsp-ssl.ls.apple.com"),
+    ] {
+        let reply = udp_query(&packet(name, 1, id, 0x0100), 30000)
+            .expect("no reply");
+        assert!(
+            answer_types(&reply).contains(&1),
+            "{} returned no A record",
+            name
+        );
+    }
+}
+
+#[test]
+#[ignore]
 fn network_concurrent_lookups_are_not_serialized() {
     let _server = Server::start();
     let names = [
