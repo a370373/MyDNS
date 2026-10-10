@@ -1,8 +1,23 @@
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::thread;
+use std::time::Duration;
 
+use crate::dns::packet::build_error_response;
 use crate::resolver::service::DnsService;
+
+const MAX_CONNECTIONS: usize = 256;
+const IO_TIMEOUT: Duration = Duration::from_secs(10);
+
+struct ActiveConnection(Arc<AtomicUsize>);
+
+impl Drop for ActiveConnection {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 
 pub fn run(
     address: &str,
@@ -16,13 +31,28 @@ pub fn run(
         address
     );
 
+    let active = Arc::new(AtomicUsize::new(0));
+
     for connection in listener.incoming() {
         match connection {
             Ok(stream) => {
+                if active.fetch_add(1, Ordering::SeqCst)
+                    >= MAX_CONNECTIONS
+                {
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    continue;
+                }
+
                 let service =
                     service.clone();
 
+                let guard = ActiveConnection(
+                    Arc::clone(&active),
+                );
+
                 thread::spawn(move || {
+                    let _guard = guard;
+
                     if let Err(error) =
                         handle_connection(
                             stream,
@@ -53,6 +83,11 @@ fn handle_connection(
     mut stream: TcpStream,
     service: DnsService,
 ) -> io::Result<()> {
+    // An idle or stalled client must not pin a thread forever.
+    stream.set_read_timeout(Some(IO_TIMEOUT))?;
+    stream.set_write_timeout(Some(IO_TIMEOUT))?;
+    stream.set_nodelay(true)?;
+
     loop {
         /*
          * DNS over TCP:
@@ -69,8 +104,12 @@ fn handle_connection(
             Ok(()) => {}
 
             Err(error)
-                if error.kind()
-                    == io::ErrorKind::UnexpectedEof =>
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::UnexpectedEof
+                        | io::ErrorKind::WouldBlock
+                        | io::ErrorKind::TimedOut
+                ) =>
             {
                 return Ok(());
             }
@@ -86,7 +125,7 @@ fn handle_connection(
             ) as usize;
 
         if length == 0 {
-            continue;
+            return Ok(());
         }
 
         let mut request =
@@ -97,9 +136,12 @@ fn handle_connection(
         )?;
 
         let response =
-            service.handle_query(
-                &request,
-            )?;
+            match service.handle_query(&request) {
+                Ok(response) => response,
+
+                // Answer SERVFAIL instead of resetting the connection.
+                Err(_) => build_error_response(&request, 2)?,
+            };
 
         let response_length =
             u16::try_from(
@@ -112,15 +154,15 @@ fn handle_connection(
                 )
             })?;
 
-        stream.write_all(
-            &response_length
-                .to_be_bytes(),
-        )?;
+        let mut framed =
+            Vec::with_capacity(response.len() + 2);
 
-        stream.write_all(
-            &response,
-        )?;
+        framed.extend_from_slice(
+            &response_length.to_be_bytes(),
+        );
+        framed.extend_from_slice(&response);
 
+        stream.write_all(&framed)?;
         stream.flush()?;
     }
 }

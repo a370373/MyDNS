@@ -105,6 +105,8 @@ async fn main() {
                 "MyDNS UDP server error: {}",
                 error
             );
+
+            std::process::exit(1);
         }
     });
 
@@ -129,6 +131,8 @@ async fn main() {
                 "MyDNS TCP server error: {}",
                 error
             );
+
+            std::process::exit(1);
         }
     });
 

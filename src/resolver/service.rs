@@ -46,6 +46,19 @@ impl DnsService {
             );
         }
 
+        // A datagram that is itself a response is not a query.
+        if request[2] & 0x80 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "not a query",
+            ));
+        }
+
+        // Only standard queries (opcode 0) are implemented.
+        if (request[2] >> 3) & 0x0f != 0 {
+            return build_error_response(request, 4);
+        }
+
         let mut pos = 12;
 
         let domain =
@@ -123,45 +136,13 @@ impl DnsService {
                     record_type,
                 )
             {
-                if let Some(record) =
-                    records.first()
-                {
-                    match record {
-                        DnsRecord::A(record)
-                        | DnsRecord::AAAA(record) => {
-                            println!(
-                                "Cache hit: {}",
-                                record.address
-                            );
+                println!("Cache hit: {}", domain);
 
-                            let ip_record =
-                                IpRecord {
-                                    name: record.name.clone(),
-                                    address: record.address.clone(),
-                                };
-
-                            return build_response_with_cname(
-                                request,
-                                None,
-                                &ip_record,
-                            );
-                        }
-
-                        DnsRecord::Https(record) => {
-                            println!(
-                                "Cache hit HTTPS: {}",
-                                record.name
-                            );
-
-                            return build_response_with_https(
-                                request,
-                                record,
-                            );
-                        }
-
-                        DnsRecord::Cname(_) => {}
-                    }
-                }
+                return build_answer(
+                    request,
+                    &records,
+                    record_type,
+                );
             }
         }
 
@@ -280,13 +261,23 @@ impl DnsService {
             );
         }
 
-        let record =
-            &resolution.records[0];
-
         /*
-         * Cache
+         * Cache the whole answer (CNAME chain included) under the
+         * type that was asked for, so later lookups actually hit.
+         * A chain that never reached the requested type is not cached.
          */
+        if resolution
+            .records
+            .iter()
+            .any(|record| record.record_type() == record_type)
         {
+            let ttl = resolution
+                .records
+                .iter()
+                .map(|record| record.ttl())
+                .min()
+                .unwrap_or(0);
+
             let mut cache =
                 self.cache.lock().map_err(|_| {
                     io::Error::new(
@@ -297,9 +288,9 @@ impl DnsService {
 
             cache.insert(
                 &domain,
-                record.record_type(),
-                vec![record.clone()],
-                record.ttl() as u64,
+                record_type,
+                resolution.records.clone(),
+                ttl as u64,
             );
 
             println!(
@@ -308,57 +299,54 @@ impl DnsService {
             );
         }
 
-        println!(
-            "Answer: {} {}",
-            record.name(),
-            record.record_type()
-        );
+        build_answer(
+            request,
+            &resolution.records,
+            record_type,
+        )
+    }
+}
 
-        /*
-         * Build response
-         */
-        match record {
-            DnsRecord::A(record)
-            | DnsRecord::AAAA(record) => {
-                let ip_record =
-                    IpRecord {
-                        name: record.name.clone(),
-                        address: record.address.clone(),
-                    };
+/// Build the reply from a (possibly CNAME-prefixed) record set.
+fn build_answer(
+    request: &[u8],
+    records: &[DnsRecord],
+    record_type: u16,
+) -> io::Result<Vec<u8>> {
+    let answer = records
+        .iter()
+        .find(|record| record.record_type() == record_type)
+        .or_else(|| {
+            records
+                .iter()
+                .find(|record| !matches!(record, DnsRecord::Cname(_)))
+        });
 
-                let cname =
-                    resolution.records.iter().find_map(
-                        |item| {
-                            match item {
-                                DnsRecord::Cname(cname) => {
-                                    Some(cname)
-                                }
+    match answer {
+        Some(DnsRecord::A(record))
+        | Some(DnsRecord::AAAA(record)) => {
+            let cname =
+                records.iter().find_map(|item| match item {
+                    DnsRecord::Cname(cname) => Some(cname),
+                    _ => None,
+                });
 
-                                _ => None,
-                            }
-                        },
-                    );
+            let ip_record = IpRecord {
+                name: record.name.clone(),
+                address: record.address.clone(),
+            };
 
-                build_response_with_cname(
-                    request,
-                    cname,
-                    &ip_record,
-                )
-            }
-
-            DnsRecord::Https(record) => {
-                build_response_with_https(
-                    request,
-                    record,
-                )
-            }
-
-            DnsRecord::Cname(_) => {
-                build_error_response(
-                    request,
-                    0,
-                )
-            }
+            build_response_with_cname(
+                request,
+                cname,
+                &ip_record,
+            )
         }
+
+        Some(DnsRecord::Https(record)) => {
+            build_response_with_https(request, record)
+        }
+
+        _ => build_error_response(request, 0),
     }
 }

@@ -822,6 +822,8 @@ pub fn build_response_with_cname(
         &request[12..pos + 4],
     );
 
+    let mut answer_owner = 0xc00cu16;
+
     if let Some(cname) = cname {
         response.extend_from_slice(
             &0xc00cu16.to_be_bytes(),
@@ -866,13 +868,21 @@ pub fn build_response_with_cname(
             &(encoded.len() as u16).to_be_bytes(),
         );
 
+        // The address record is owned by the CNAME target, which
+        // starts at the CNAME RDATA; point at it with a compression
+        // pointer.
+        if response.len() < 0x4000 {
+            answer_owner =
+                0xc000 | response.len() as u16;
+        }
+
         response.extend_from_slice(
             &encoded,
         );
     }
 
     response.extend_from_slice(
-        &0xc00cu16.to_be_bytes(),
+        &answer_owner.to_be_bytes(),
     );
 
     let address: std::net::IpAddr =
@@ -968,35 +978,40 @@ pub fn build_error_response(
         &flags.to_be_bytes(),
     );
 
-    response.extend_from_slice(
-        &1u16.to_be_bytes(),
-    );
-
-    response.extend_from_slice(
-        &0u16.to_be_bytes(),
-    );
-
-    response.extend_from_slice(
-        &0u16.to_be_bytes(),
-    );
-
-    response.extend_from_slice(
-        &0u16.to_be_bytes(),
-    );
-
+    // An unparsable question (e.g. FORMERR) is answered with an
+    // empty question section instead of failing to answer at all.
     let mut pos = 12;
 
-    read_name(request, &mut pos)?;
+    let question_end = match read_name(request, &mut pos) {
+        Ok(_) if pos + 4 <= request.len() => Some(pos + 4),
+        _ => None,
+    };
 
-    if pos + 4 > request.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "question",
-        ));
-    }
+    let question_count: u16 =
+        if question_end.is_some() { 1 } else { 0 };
 
     response.extend_from_slice(
-        &request[12..pos + 4],
+        &question_count.to_be_bytes(),
+    );
+
+    response.extend_from_slice(
+        &0u16.to_be_bytes(),
+    );
+
+    response.extend_from_slice(
+        &0u16.to_be_bytes(),
+    );
+
+    response.extend_from_slice(
+        &0u16.to_be_bytes(),
+    );
+
+    let Some(end) = question_end else {
+        return Ok(response);
+    };
+
+    response.extend_from_slice(
+        &request[12..end],
     );
 
     append_edns_response(
